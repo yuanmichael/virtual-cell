@@ -1,0 +1,20 @@
+# Virtual environment
+.venv/
+__pycache__/
+*.pyc
+
+# Credentials — .env.txt holds the VCC API token
+.env.txt
+*.key
+
+# Challenge data and derived artifacts: large, and all re-downloadable
+# (`vcc datasets download`, or src/rehearsal.py for the 2025 splits).
+data/
+external/
+*.zip
+*.h5ad
+*.vcc
+*.ckpt
+*.npz
+*.parquet
+*.pt
