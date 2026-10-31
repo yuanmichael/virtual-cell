@@ -26,7 +26,7 @@ from common import (
     REHEARSAL, VOL, VOL_PATH, WORK, app, eval_image, state_image,
 )
 
-MODEL_DIR = f"{VOL_PATH}/state/runs/v3/v3"
+MODEL_DIR = f"{VOL_PATH}/state/runs/v3/v3"   # default; override with --model-tag
 # Model input must be in the SAME space the model was trained in (log1p CP10k),
 # while scoring compares against the raw-count originals.
 TEST_IN = f"{VOL_PATH}/state/norm/adata_Test.h5ad"
@@ -43,7 +43,8 @@ OUTDIR = f"{WORK}/state_eval"
     timeout=60 * 60 * 4,
 )
 def predict(limit_perts: int = 0, ckpt: str = "best.ckpt", seed: int = 0,
-            calibrate: bool = False, log_space: bool = True):
+            calibrate: bool = False, log_space: bool = True,
+            model_tag: str = "", out_name: str = ""):
     """Run STATE on the test split and write a counts-space prediction."""
     import os
     import subprocess
@@ -57,9 +58,11 @@ def predict(limit_perts: int = 0, ckpt: str = "best.ckpt", seed: int = 0,
     os.makedirs(OUTDIR, exist_ok=True)
     t0 = time.time()
 
-    ckpt_path = f"{MODEL_DIR}/checkpoints/{ckpt}"
-    for p in (ckpt_path, f"{MODEL_DIR}/config.yaml",
-              f"{MODEL_DIR}/pert_onehot_map.pt", TEST_H5AD):
+    model_dir = f"{VOL_PATH}/state/runs/{model_tag}/{model_tag}" if model_tag else MODEL_DIR
+    print(f"model dir: {model_dir}")
+    ckpt_path = f"{model_dir}/checkpoints/{ckpt}"
+    for p in (ckpt_path, f"{model_dir}/config.yaml",
+              f"{model_dir}/pert_onehot_map.pt", TEST_H5AD):
         if not os.path.exists(p):
             raise FileNotFoundError(p)
 
@@ -67,7 +70,7 @@ def predict(limit_perts: int = 0, ckpt: str = "best.ckpt", seed: int = 0,
     # one-hot: at inference, a perturbation absent from this map silently falls
     # back to the control vector (_infer.py:802-804), which would mean "predict
     # no change" and look like a model failure rather than a lookup miss.
-    pmap = torch.load(f"{MODEL_DIR}/pert_onehot_map.pt", weights_only=False)
+    pmap = torch.load(f"{model_dir}/pert_onehot_map.pt", weights_only=False)
     dims = {tuple(v.shape) for v in pmap.values()}
     n_onehot = sum(1 for v in pmap.values()
                    if float((v != 0).sum()) == 1 and float(v.sum()) == 1.0)
@@ -140,7 +143,7 @@ def predict(limit_perts: int = 0, ckpt: str = "best.ckpt", seed: int = 0,
     _ts.load = _load
 
     args = argparse.Namespace(
-        checkpoint=ckpt_path, adata=src, output=raw_out, model_dir=MODEL_DIR,
+        checkpoint=ckpt_path, adata=src, output=raw_out, model_dir=model_dir,
         embed_key=None, pert_col="target_gene", control_pert="non-targeting",
         celltype_col="cell_type", celltypes=None, batch_col="batch",
         seed=seed, max_set_len=None, quiet=False, tsv=False, all_perts=False,
@@ -243,7 +246,7 @@ def predict(limit_perts: int = 0, ckpt: str = "best.ckpt", seed: int = 0,
     )
     out.var_names = P.var_names
     out.obs_names = [f"s{i}" for i in range(out.n_obs)]
-    pred_path = f"{OUTDIR}/state_pred_counts.h5ad"
+    pred_path = f"{OUTDIR}/{out_name or 'state_pred_counts.h5ad'}"
     out.write_h5ad(pred_path, compression="lzf")
     VOL.commit()
     print(f"wrote {pred_path} in {time.time()-t0:.0f}s")
@@ -343,6 +346,73 @@ def transfer_predict(real_name: str = "test_subset.h5ad", scale: float = 6.0,
 
 
 @app.function(
+    image=eval_image, volumes={VOL_PATH: VOL},
+    cpu=8.0, memory=49152, timeout=60 * 60 * 2,
+)
+def ensemble(w: float = 0.5, a_name: str = "state_pred_counts.h5ad",
+             b_name: str = "transfer_pred_counts.h5ad", seed: int = 0,
+             out_name: str = ""):
+    """Average two counts-space predictions: w*A + (1-w)*B.
+
+    Worth trying because the two models fail differently on the same cells:
+    STATE wins pds_cosine 5x (per-cell profile, which its cell-conditioning
+    buys) while the transfer model is equal or ahead on all four DE metrics.
+    Complementary rather than redundant.
+
+    Cells within a perturbation are exchangeable draws, so pairing row i of A
+    with row i of B is arbitrary but harmless; what matters is that both arms
+    contribute to the same perturbation.
+    """
+    import os
+
+    import anndata as ad
+    import numpy as np
+    import scipy.sparse as sp
+
+    A = ad.read_h5ad(f"{OUTDIR}/{a_name}")
+    B = ad.read_h5ad(f"{OUTDIR}/{b_name}")
+    if list(A.var_names) != list(B.var_names):
+        raise RuntimeError("gene spaces differ between the two predictions")
+    pa = A.obs["target_gene"].astype(str).to_numpy()
+    pb = B.obs["target_gene"].astype(str).to_numpy()
+    perts = sorted(set(pa) & set(pb))
+    print(f"A {A.shape}  B {B.shape}  shared perturbations {len(perts)}")
+    if set(pa) != set(pb):
+        print(f"  WARNING dropping unmatched: "
+              f"{sorted(set(pa) ^ set(pb))[:8]}")
+
+    Xa = A.X.tocsr() if sp.issparse(A.X) else sp.csr_matrix(A.X)
+    Xb = B.X.tocsr() if sp.issparse(B.X) else sp.csr_matrix(B.X)
+    rng = np.random.default_rng(seed)
+
+    blocks, obs_pert = [], []
+    for t in perts:
+        ia, ib = np.where(pa == t)[0], np.where(pb == t)[0]
+        n = min(len(ia), len(ib))
+        M = Xa[ia[:n]] * w + Xb[ib[:n]] * (1.0 - w)
+        M = M.tocsr()
+        d = np.asarray(M.data, dtype=np.float64)
+        fl = np.floor(d)
+        M.data = (fl + (rng.random(d.shape) < (d - fl))).astype(np.float32)
+        M.eliminate_zeros()
+        blocks.append(M)
+        obs_pert += [t] * n
+
+    X = sp.vstack(blocks, format="csr")
+    assert X.data.min() >= 0 and np.all(X.data == np.floor(X.data))
+    out = ad.AnnData(X=X, obs={"target_gene": np.array(obs_pert)})
+    # Plain str, not the source's pandas Index: anndata 0.13 refuses to write
+    # a nullable-string index unless allow_write_nullable_strings is set.
+    out.var_names = [str(g) for g in A.var_names]
+    out.obs_names = [f"e{i}" for i in range(out.n_obs)]
+    name = out_name or f"ens_w{w:g}_counts.h5ad"
+    out.write_h5ad(f"{OUTDIR}/{name}", compression="lzf")
+    VOL.commit()
+    print(f"wrote {OUTDIR}/{name}: {out.shape}, {X.nnz/1e6:.0f}M nonzeros")
+    return name
+
+
+@app.function(
     image=eval_image,
     volumes={VOL_PATH: VOL},
     cpu=8.0,
@@ -435,9 +505,10 @@ def score(pred_name: str = "state_pred_counts.h5ad",
 @app.local_entrypoint()
 def main(limit_perts: int = 0, ckpt: str = "best.ckpt", seed: int = 0,
          calibrate: bool = False, log_space: bool = True,
+         model_tag: str = "", out_name: str = "",
          block: bool = False):
     if block:
-        predict.remote(limit_perts, ckpt, seed, calibrate, log_space)
+        predict.remote(limit_perts, ckpt, seed, calibrate, log_space, model_tag, out_name)
         return
-    call = predict.spawn(limit_perts, ckpt, seed, calibrate, log_space)
+    call = predict.spawn(limit_perts, ckpt, seed, calibrate, log_space, model_tag, out_name)
     print(f"spawned: {call.object_id}")

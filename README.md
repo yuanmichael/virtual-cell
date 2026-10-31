@@ -260,7 +260,7 @@ multi-GB intermediates off the laptop.
 - Don't pipe Modal output through PowerShell's `Select-Object` — it truncates
   errors into unreadable `RemoteError`s.
 
-Spend to date ≈ **$9.00** (transfer model ~$1.4, STATE route ~$7.6).
+Spend to date ≈ **$13.00** (transfer model ~$1.4, STATE route ~$11.6).
 
 ## Layout
 
@@ -445,26 +445,93 @@ likely hook; unverified.
 under a minute each for a few cents, any of which would have wasted hours of
 GPU.
 
+## Part 3 — ensembling, and a failed architecture change
+
+All numbers below are the **same 20 test perturbations**, same cached baseline
+and lfc_nmae reference.
+
+| prediction | avg |
+|---|---|
+| **ensemble v3 + transfer, w=0.5** | **+0.1041** |
+| 3-way (v3 + v4 + transfer) | +0.1033 |
+| ensemble w=0.3 / w=0.7 | +0.0975 / +0.0932 |
+| ensemble v4 + transfer | +0.0751 |
+| STATE v3 (`cell_set_len` 64) | +0.0656 |
+| K562 transfer | +0.0535 |
+| STATE v4 (`cell_set_len` 512) | +0.0516 |
+
+### The ensemble works, and it is the best thing we have
+
+Averaging STATE v3 and the transfer model 50/50 (then stochastically rounding)
+scores **+0.1041 against +0.0535 for the transfer model alone on the same
+cells** — close to double, for ~$0.50 of compute and no new model. The blend
+sweep is concave with a clean peak at equal weighting, which is also the least
+overfit choice.
+
+It works because the two models fail differently: STATE wins `pds_cosine` 5×
+(the per-cell-profile metric its cell-conditioning buys), the transfer model is
+equal or ahead on all four DE metrics. Complementary, not redundant.
+
+Likely a **floor, not a ceiling**: the transfer arm is running at λ ≈ 0 here
+(K562 covers only 4 of these 20 genes), so it contributes just its generic
+response. On the 2026 panel it has 92% coverage.
+
+### `cell_set_len` 512 made the model better and the score worse
+
+Held cells-per-step and total data volume identical to v3 (6,000 × 2 × 512 =
+6,000 × 16 × 64 = 6.14M cell-presentations), so set size was the only variable.
+
+| | v3 (set 64) | v4 (set 512) |
+|---|---|---|
+| best val loss | 0.544 | **0.388** |
+| `de_wilcoxon_lfc_nmae` | −0.217 | **−0.055** |
+| `de_wilcoxon_direction_reach` | −0.019 | **+0.017** |
+| `de_wilcoxon_direction_fidelity` | **+0.336** | +0.316 |
+| `de_wilcoxon_sig_jaccard` | **+0.136** | +0.110 |
+| `pds_cosine` | **+0.158** | **−0.079** |
+| avg | **+0.0656** | +0.0516 |
+
+Two findings:
+
+- **Val loss is not the competition metric.** v4 is 29% better on validation
+  loss and *worse* on the leaderboard metric. Demonstrated, not asserted.
+- **Larger cell sets trade per-cell fidelity for aggregate accuracy.** v4 fixed
+  magnitudes (nmae 3.9× better) and reach, but `pds_cosine` collapsed from
+  +0.158 to −0.079 — and `pds_cosine` is exactly what makes STATE worth
+  ensembling. Prediction, untested: `cell_set_len` *below* 64 may push
+  `pds_cosine` higher, which is the lever the ensemble rewards.
+
+A prior hypothesis **refuted**: I expected bigger sets to *strengthen*
+`pds_cosine`, since set-level attention is the mechanism behind STATE's edge
+there. It did the opposite.
+
+## State of play
+
+- **Live entry:** the K562 transfer model (`scale=6.0`, `lam=0.2`), entry
+  `umpZxC06qd3VDMERWNwm`. Unchanged.
+- **Best measured model:** ensemble of STATE v3 + transfer, **unsubmitted**.
+- Spend ≈ **$13**.
+
 ## Next
 
-Ranked by expected payoff. The binding constraint is **150 training
-perturbations** — v3's val loss flattened at step 3,199 (0.544) and never
-improved, so the model has extracted what is there. More steps and bigger
-architectures will not help; more perturbations will.
-
-1. **Ensemble STATE + transfer.** The per-metric table shows they fail
-   differently — STATE wins `pds_cosine` 5×, transfer wins all four DE metrics.
-   Complementary, not redundant. Cheapest real win, reuses everything.
-2. **`cell_set_len` 64 → 512** (Arc's default). 8× more cells per attention
-   set, which is the mechanism behind STATE's `pds_cosine` edge.
-3. **Train on Replogle single-cell.** 9,866 perturbations across K562 *and*
+1. **Submit the ensemble.** The one measured, controlled improvement we have
+   (+0.1041 vs +0.0535 on identical cells) and it is worth nothing unsubmitted.
+   Needs: STATE inference on D/E/F controls, mapping the model's 18,080-gene
+   output into the submission's 18,533 (18,077 overlap; the rest stay at
+   control values), blending, `vcc prep`. ~$3.
+   **Note:** in the final phase the LATEST submission is the prize entry, so
+   this replaces the current one — and scores are hidden, so a regression would
+   be invisible.
+2. **Train on Replogle single-cell.** 9,866 perturbations across K562 *and*
    RPE1 versus our 150 in one cell type: 65× the perturbation diversity for the
    ESM-2 encoder, and the first genuine cross-cell-line examples — which is
-   literally the task. The only change that lifts the data ceiling rather than
-   working around it.
-4. **Attack `reach`.** The one metric both models fail, and immune to magnitude
-   scaling (confirmed by the scale sweep: −0.102 → −0.105 → −0.067). It is
-   about predicted *variance*, not mean shift. Untried.
+   literally the task. The only change that lifts the **data** ceiling; v3's
+   val loss flattened by step 3,199, and #3's failure shows architecture
+   tinkering around a 150-perturbation limit has run out. ~$15–25.
+3. **`cell_set_len` below 64**, per the trade-off above. ~$2.50.
+4. **Attack `reach`.** Still the weakest metric, and immune to magnitude
+   scaling (scale sweep: −0.102 → −0.105 → −0.067). It is about predicted
+   *variance*, not mean shift. Untried.
 
 ### Not an option
 
