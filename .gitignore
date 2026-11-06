@@ -18,3 +18,16 @@ external/
 *.npz
 *.parquet
 *.pt
+
+# Modal FunctionCall ids and run logs: per-session scratch, not source.
+.*_call
+.*_calls
+.rep_fast_smoke
+.tr_recall
+.tr_score
+.ens_fc
+.ens_score
+.prep_call
+.blend_call
+.send_call
+*.log

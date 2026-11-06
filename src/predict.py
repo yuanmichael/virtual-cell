@@ -55,6 +55,7 @@ def build(
     lam: float = 0.15,
     lam_mode: str = "ramp",
     lam_thr: float = 2.0,
+    denoise: str = "",
     contexts: str = "D,E,F",
 ):
     import json
@@ -84,6 +85,16 @@ def build(
     common_k = axis["common"].astype(np.float64)
     lut_targets = [str(t) for t in axis["targets"]]
     lut = axis["lookup"].astype(np.float64)
+    # `pool{k}` replaces each target's residual with the mean over its k
+    # nearest neighbours among all 9,866 K562 perturbations. The effect-size
+    # gate that sets `lam` still reads the unpooled lookup, so it keeps
+    # measuring how well the target itself was measured.
+    lut_blend = lut
+    if denoise:
+        if denoise not in axis.files:
+            raise KeyError(f"{denoise!r} not in {AXIS}: {sorted(axis.files)}")
+        lut_blend = axis[denoise].astype(np.float64)
+        print(f"denoise: {denoise}")
     null_med = float(axis["null_med_abs"])
 
     # Readout genes that this panel actually scores, and their columns in it.
@@ -106,7 +117,7 @@ def build(
     cm = common_k[kkeep]
     lfc = np.zeros((len(targets), len(kcols)))
     for j, t in enumerate(targets):
-        spec = (lut[lut_ix[t]][kkeep] - cm) if covered[j] else 0.0
+        spec = (lut_blend[lut_ix[t]][kkeep] - cm) if covered[j] else 0.0
         lfc[j] = scale * (cm + lams[j] * spec)
     fac = np.ones((len(targets), len(genes)))
     fac[:, kcols] = np.power(2.0, lfc)
@@ -225,10 +236,10 @@ def prep(h5ad_path: str = OUT_H5AD, out_name: str = "transfer.vcc",
 
 @app.local_entrypoint()
 def main(scale: float = 4.0, lam: float = 0.15, lam_mode: str = "ramp",
-         lam_thr: float = 2.0, contexts: str = "D,E,F",
+         lam_thr: float = 2.0, denoise: str = "", contexts: str = "D,E,F",
          skip_build: bool = False, out_name: str = "transfer.vcc",
          dry_run: bool = False):
     path = OUT_H5AD if skip_build else build.remote(
-        scale, lam, lam_mode, lam_thr, contexts)
+        scale, lam, lam_mode, lam_thr, denoise, contexts)
     print("prediction:", path)
     print("packaged:", prep.remote(path, out_name, dry_run))

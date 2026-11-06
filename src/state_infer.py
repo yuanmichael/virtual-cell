@@ -44,7 +44,18 @@ OUTDIR = f"{WORK}/state_eval"
 )
 def predict(limit_perts: int = 0, ckpt: str = "best.ckpt", seed: int = 0,
             calibrate: bool = False, log_space: bool = True,
-            model_tag: str = "", out_name: str = ""):
+            model_tag: str = "", out_name: str = "",
+            test_in: str = "", test_real: str = "",
+            log_clip: float = 14.0):
+    """`test_in`/`test_real` override the 2025 paths.
+
+    A Replogle-trained model emits its own 6,714-gene space, so it must be fed
+    cells in that space and -- importantly -- have its output depth-matched
+    against a real arm in the SAME space. Scoring against the 18,080-gene
+    original here would rescale every cell by the ratio of two different gene
+    sets' library sizes. The lift back to 18,080 happens afterwards, in
+    src/replogle_bridge.py.
+    """
     """Run STATE on the test split and write a counts-space prediction."""
     import os
     import subprocess
@@ -61,8 +72,10 @@ def predict(limit_perts: int = 0, ckpt: str = "best.ckpt", seed: int = 0,
     model_dir = f"{VOL_PATH}/state/runs/{model_tag}/{model_tag}" if model_tag else MODEL_DIR
     print(f"model dir: {model_dir}")
     ckpt_path = f"{model_dir}/checkpoints/{ckpt}"
+    t_in = test_in or TEST_IN
+    t_real = test_real or TEST_H5AD
     for p in (ckpt_path, f"{model_dir}/config.yaml",
-              f"{model_dir}/pert_onehot_map.pt", TEST_H5AD):
+              f"{model_dir}/pert_onehot_map.pt", t_real, t_in):
         if not os.path.exists(p):
             raise FileNotFoundError(p)
 
@@ -86,11 +99,11 @@ def predict(limit_perts: int = 0, ckpt: str = "best.ckpt", seed: int = 0,
     # is the space it was trained in, while scoring needs the raw-count
     # original as ground truth. The normalised file is a byte-for-byte copy
     # apart from X, so one boolean mask selects identical cells in both.
-    src, real_src = TEST_IN, TEST_H5AD
+    src, real_src = t_in, t_real
     if limit_perts:
         # Subset to a few perturbations so the first pass is cheap. Controls
         # must come along: inference samples its basal cells from them.
-        Araw = ad.read_h5ad(TEST_H5AD)
+        Araw = ad.read_h5ad(t_real)
         pert = Araw.obs["target_gene"].astype(str)
         keep_perts = sorted(set(pert) - {"non-targeting"})[:limit_perts]
         mask = pert.isin(keep_perts + ["non-targeting"]).to_numpy()
@@ -98,7 +111,7 @@ def predict(limit_perts: int = 0, ckpt: str = "best.ckpt", seed: int = 0,
         Araw[mask].copy().write_h5ad(real_src, compression="lzf")
         del Araw
 
-        Anorm = ad.read_h5ad(TEST_IN)
+        Anorm = ad.read_h5ad(t_in)
         if len(Anorm) != len(mask):
             raise RuntimeError(
                 f"normalised test has {len(Anorm)} cells, raw has {len(mask)} "
@@ -173,7 +186,23 @@ def predict(limit_perts: int = 0, ckpt: str = "best.ckpt", seed: int = 0,
         # inverse. (An earlier run applied expm1 to a COUNT-space model, which
         # exponentiated already-linear values and pinned lfc_nmae at its cap --
         # same call, opposite correctness, because the training space changed.)
-        Xp = np.expm1(np.clip(Xp, 0.0, 14.0))
+        # `state tx infer`'s own bound is [0, 14], which is only sensible as
+        # "log1p of a plausible count". But our training data's actual max was
+        # 4.85, and the Replogle model emitted up to 10.7 -- expm1 turns that
+        # into 44,833 against a p99 of 21.46. A handful of absurd values per
+        # cell destroys every fold-change MAGNITUDE while leaving the direction
+        # of change intact, which is precisely the signature we measured:
+        # fidelity/jaccard/reach healthy, de_wilcoxon_lfc_nmae pinned at its
+        # -6.0 penalty cap.
+        #
+        # So clip to what the model could legitimately have learned. 14.0 keeps
+        # the old behaviour for the 2025-trained models.
+        n_over = int((Xp > log_clip).sum())
+        if n_over:
+            print(f"log-space clip at {log_clip}: {n_over:,} values "
+                  f"({n_over/Xp.size*100:.4f}%) exceeded it, "
+                  f"max was {Xp.max():.2f}")
+        Xp = np.expm1(np.clip(Xp, 0.0, log_clip))
     # Otherwise the model's output is already count-scale, nothing to invert.
     # cell-load applies log1p only when is_log1p=True, and its normalize_counts
     # option is dead config in 0.10.4 (stored and round-tripped, never applied)

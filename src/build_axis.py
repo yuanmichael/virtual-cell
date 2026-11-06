@@ -30,6 +30,23 @@ DEPTH = 1e4      # rows are already ~depth-normalised; fix it exactly
 EPS = 1e-3       # ~1000x below the median gene, so log-ratios stay finite
 MIN_EXPR = 0.05  # 5 CPM at DEPTH, matching the VCC DE-eligibility filter
 
+# Neighbourhood sizes for the pooled lookups. A single K562 perturbation
+# measurement is ~60% noise, so the residual that carries all our score
+# transfers at only r ~= 0.09 to a held-out cell line. Averaging a target's
+# residual with its nearest neighbours in residual space cancels independent
+# noise and lifts that to ~0.13 (src/denoise_probe.py) -- the cheapest version
+# of "pool across similar genes", using the 9,866 perturbations we already have
+# rather than a new model.
+POOL_KS = (10, 30, 100)
+
+# Neighbours are only worth borrowing from if they were measured well
+# themselves. src/denoise_pool.py swept the filter: pooling from all 10,673
+# rows gives r=+0.082, from rows with >=100 cells r=+0.088, and from the
+# high-quality 2,052-row subset only +0.071 (too few to choose from). The
+# query row is always allowed regardless of its own cell count -- at inference
+# we have the target's own measurement whatever its quality.
+POOL_MIN_CELLS = 100
+
 
 def _decode(a):
     return np.array([v.decode() if isinstance(v, bytes) else str(v) for v in a])
@@ -57,6 +74,28 @@ def target_col(path):
     """Target genes from a CSV that has a `target_gene` column among others."""
     with open(path, newline="") as fh:
         return [r["target_gene"] for r in csv.DictReader(fh)]
+
+
+def pooled_residual(R, rows, k, allow):
+    """Mean residual over each requested row's k nearest neighbours in R.
+
+    Cosine similarity on the residuals, self included -- at inference we DO
+    have the target's own K562 row, so there is no reason to drop it, and
+    including it keeps the pooled estimate anchored on the target. `allow`
+    restricts which rows may be borrowed from; the query row is exempt.
+
+    float32 and a per-row neighbour search, so this never materialises the
+    full n x n similarity matrix nor a second float64 copy of R.
+    """
+    U = (R / np.maximum(np.linalg.norm(R, axis=1, keepdims=True), 1e-12))
+    out = np.empty((len(rows), R.shape[1]), dtype=np.float32)
+    for i, r in enumerate(rows):
+        s = U @ U[r]
+        s[~allow] = -np.inf
+        s[r] = np.inf
+        nn = np.argpartition(-s, kth=k - 1)[:k]
+        out[i] = R[nn].mean(axis=0)
+    return out
 
 
 def main():
@@ -101,8 +140,20 @@ def main():
           f"median {np.median(np.abs(null)):.4f}")
 
     # Lookups for every target either panel asks about.
+    # EVERY panel we might score against, including the 2025 val and test
+    # splits. Omitting those was a real measurement error, not a cosmetic one:
+    # the head-to-head on the test split reported the transfer model at +0.0535
+    # and concluded "K562 covers only 4 of these 20 targets, so lam was ~0".
+    # K562 in fact measured 97 of the 100 test perturbations -- we had simply
+    # never asked for their lookups, so the transfer arm ran at its
+    # generic-response floor and the ensemble was compared against a
+    # handicapped opponent.
     want = set(target_col(os.path.join(V25, "pert_counts_Training.csv")))
     want |= set(target_col(os.path.join(FIN, "pert_counts.csv")))
+    for extra in ("pert_counts_Validation.csv", "pert_counts_Test.csv"):
+        p = os.path.join(V25, extra)
+        if os.path.exists(p):
+            want |= set(target_col(p))
     want.discard("non-targeting")
     have = sorted(w for w in want if w in pidx)
     rows = np.array([pidx[w] for w in have])
@@ -110,9 +161,26 @@ def main():
     print(f"lookups: {len(have)} of {len(want)} requested targets found "
           f"in the K562 screen")
 
+    # Pooled lookups. The neighbour pool is every perturbation in the screen,
+    # not just the requested targets, which is the whole point: 9,866 rows to
+    # borrow from. `pos` maps a requested target to its place in that pool.
+    Rfull = (lfc[prows][:, gcols] - common[None, :]).astype(np.float32)
+    pos = np.searchsorted(prows, rows)
+    assert np.array_equal(prows[pos], rows), "target rows not in the pool"
+    allow = ncells[prows] >= POOL_MIN_CELLS
+    print(f"neighbour pool: {int(allow.sum())} of {len(prows)} perturbations "
+          f"measured in >={POOL_MIN_CELLS} cells")
+    pools = {}
+    for k in POOL_KS:
+        P = pooled_residual(Rfull, pos, k, allow)
+        pools[f"pool{k}"] = (common[None, :] + P).astype(np.float32)
+        shrink = np.abs(P).mean() / np.abs(Rfull[pos]).mean()
+        print(f"  pool{k}: residual |log2FC| {shrink:.2f}x the unpooled one")
+
     np.savez_compressed(
         OUT,
         readout=readout,
+        **pools,
         common=common.astype(np.float32),
         targets=np.array(have),
         lookup=lookup.astype(np.float32),

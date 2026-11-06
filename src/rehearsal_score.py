@@ -44,6 +44,7 @@ def _run(
     scale: float = 4.0,
     lam_mode: str = "ramp",
     lam_thr: float = 2.0,
+    denoise: str = "",
     seed: int = 0,
     prepare_only: bool = False,
     refs: bool = True,
@@ -81,7 +82,19 @@ def _run(
     k_genes = [str(g) for g in axis["readout"]]
     common_k = axis["common"].astype(np.float64)
     lut_targets = [str(t) for t in axis["targets"]]
+    # `lookup` is each target's own K562 response; `pool{k}` replaces its
+    # residual with the mean over its k nearest neighbours in residual space,
+    # which cancels independent measurement noise (src/denoise_probe.py). The
+    # effect-size gate below deliberately still reads the UNPOOLED lookup, so
+    # `lam` is driven by how well the target itself was measured either way.
     lut = axis["lookup"].astype(np.float64)
+    lut_blend = lut
+    if denoise:
+        if denoise not in axis.files:
+            raise KeyError(f"{denoise!r} not in {AXIS}: {sorted(axis.files)}")
+        lut_blend = axis[denoise].astype(np.float64)
+        print(f"denoise: blending with {denoise}, "
+              f"residual magnitude {np.abs(lut_blend - common_k).mean() / np.abs(lut - common_k).mean():.2f}x unpooled")
     null_med = float(axis["null_med_abs"])
     print(f"axis: {len(k_genes)} K562 readout genes, {len(lut_targets)} lookups, "
           f"null band {null_med:.4f}")
@@ -189,7 +202,7 @@ def _run(
     cm = common_k[kkeep]
     lfc = np.zeros((len(targets), len(kcols)))
     for j, t in enumerate(targets):
-        spec = (lut[lut_ix[t]][kkeep] - cm) if covered[j] else 0.0
+        spec = (lut_blend[lut_ix[t]][kkeep] - cm) if covered[j] else 0.0
         lfc[j] = scale * (cm + lams[j] * spec)
     print(f"predicted |log2FC|: mean {np.abs(lfc).mean():.4f}  "
           f"p99 {np.quantile(np.abs(lfc), 0.99):.3f}  "
@@ -278,7 +291,7 @@ def _run(
     print(uw)
 
     out = {"lam": lam, "scale": scale, "lam_mode": lam_mode,
-           "lam_thr": lam_thr, "tag": tag, "full": full,
+           "lam_thr": lam_thr, "denoise": denoise, "tag": tag, "full": full,
            "n_perts": len(targets), "cells_per_pert": cells_per_pert,
            "n_control": half, "integer_counts": integer_counts,
            "raw_user": uw.to_dicts()}
@@ -353,29 +366,104 @@ run_small = app.function(
 )(_run)
 
 
-@app.local_entrypoint()
-def main(lam: float = 0.15, scale: float = 4.0, scales: str = "",
-         lam_mode: str = "ramp", lam_thr: float = 2.0, seed: int = 0,
-         prepare_only: bool = False, refs: bool = True, ceiling: bool = False,
-         integer_counts: bool = True, n_perts: int = 0,
-         cells_per_pert: int = REAL_CELLS_PER_PERT,
-         n_control: int = N_CONTROL, small: bool = False, tag: str = ""):
-    fn = run_small if small else run
-    # `--scales 6,9,13,18` sweeps the magnitude dial. Each point reuses the
-    # cached ground-truth DE and reference aggregates, so it costs one DE pass.
-    todo = [float(s) for s in scales.split(",") if s.strip()] or [scale]
-    results = {}
-    for s in todo:
-        r = fn.remote(lam, s, lam_mode, lam_thr, seed, prepare_only, refs,
-                      ceiling, integer_counts, n_perts, cells_per_pert,
-                      n_control, tag or (f"scale{s:g}" if len(todo) > 1 else ""))
+def _sweep(points, **kw):
+    """Run several (denoise, lam, scale) points inside ONE container.
+
+    Each point reuses the cached ground-truth DE and reference aggregates, so
+    the marginal cost of a point is one DE pass -- but a separate container per
+    point would pay cold start plus a read of the 15 GB backed source every
+    time, which dominated the actual spend. Looping here pays that once.
+    """
+    out = {}
+    for denoise, lam, scale in points:
+        tag = f"{denoise or 'raw'}_lam{lam:g}_scale{scale:g}"
+        print(f"\n{'='*70}\n{tag}\n{'='*70}", flush=True)
+        try:
+            r = _run(lam=lam, scale=scale, denoise=denoise, tag=tag, **kw)
+        except Exception as e:  # noqa: BLE001 - one bad point must not end the sweep
+            print(f"!! {tag} failed: {type(e).__name__}: {e}")
+            continue
         if r and r.get("scaled"):
             avg = [x for x in r["scaled"] if x["metric"] == "avg_score"]
             if avg:
-                results[s] = avg[0]["from_baseline"]
+                out[tag] = avg[0]["from_baseline"]
+                # Keep the per-metric breakdown: the avg can stay flat while
+                # fidelity and lfc_nmae move in opposite directions, which is
+                # what the scale sweep showed and what we need to see here.
+                out[tag + "__metrics"] = {
+                    x["metric"]: x["from_baseline"] for x in r["scaled"]
+                }
+    print(f"\n{'='*70}\nSWEEP RESULTS\n{'='*70}")
+    scores = {k: v for k, v in out.items() if not k.endswith("__metrics")}
+    for k in sorted(scores, key=lambda k: -scores[k]):
+        print(f"  {k:<32s} avg_score {scores[k]:+.4f}")
+    return out
+
+
+sweep = app.function(
+    image=eval_image, volumes={VOL_PATH: VOL},
+    cpu=4.0, memory=16384, timeout=60 * 60 * 5,
+    name="sweep",
+)(_sweep)
+
+
+@app.local_entrypoint()
+def main(lam: float = 0.15, scale: float = 4.0, scales: str = "",
+         lams: str = "", lam_mode: str = "ramp", lam_thr: float = 2.0,
+         denoise: str = "", seed: int = 0,
+         prepare_only: bool = False, refs: bool = True, ceiling: bool = False,
+         integer_counts: bool = True, n_perts: int = 0,
+         cells_per_pert: int = REAL_CELLS_PER_PERT,
+         n_control: int = N_CONTROL, small: bool = False, tag: str = "",
+         denoises: str = ""):
+    # `--denoises raw,pool10,pool30 --lams 0.2,0.5,1.0` sweeps the denoise
+    # variant and lam together in ONE container. "raw" means the unpooled
+    # lookup, i.e. the model as shipped.
+    if denoises:
+        pts = [
+            ("" if d.strip() in ("raw", "") else d.strip(), lm, s)
+            for d in denoises.split(",") if d.strip()
+            for lm in ([float(x) for x in lams.split(",") if x.strip()] or [lam])
+            for s in ([float(x) for x in scales.split(",") if x.strip()] or [scale])
+        ]
+        print(f"sweeping {len(pts)} points in one container")
+        res = sweep.remote(
+            pts, lam_mode=lam_mode, lam_thr=lam_thr, seed=seed, refs=refs,
+            ceiling=ceiling, integer_counts=integer_counts, n_perts=n_perts,
+            cells_per_pert=cells_per_pert, n_control=n_control,
+        )
+        scores = {k: v for k, v in (res or {}).items()
+                  if not k.endswith("__metrics")}
+        if scores:
+            best = max(scores, key=scores.get)
+            print(f"\nbest: {best} at {scores[best]:+.4f}")
+            for m, v in sorted((res.get(best + "__metrics") or {}).items()):
+                print(f"    {m:<42s} {v:+.4f}")
+        return
+
+    fn = run_small if small else run
+    # `--scales 6,9,13,18` or `--lams 0.2,0.5,1.0` sweeps one dial. Each point
+    # reuses the cached ground-truth DE and reference aggregates, so it costs
+    # one DE pass. Pooling shrinks the residual (pool30 to 0.68x), so a pooled
+    # run needs its own lam sweep rather than inheriting the shipped 0.2.
+    s_todo = [float(s) for s in scales.split(",") if s.strip()] or [scale]
+    l_todo = [float(x) for x in lams.split(",") if x.strip()] or [lam]
+    results = {}
+    for s in s_todo:
+        for lm in l_todo:
+            auto = f"{denoise or 'raw'}_lam{lm:g}_scale{s:g}"
+            r = fn.remote(lm, s, lam_mode, lam_thr, denoise, seed,
+                          prepare_only, refs, ceiling, integer_counts,
+                          n_perts, cells_per_pert, n_control,
+                          tag or (auto if len(s_todo) * len(l_todo) > 1 else ""))
+            if r and r.get("scaled"):
+                avg = [x for x in r["scaled"] if x["metric"] == "avg_score"]
+                if avg:
+                    results[(s, lm)] = avg[0]["from_baseline"]
     if len(results) > 1:
-        print("\n=== scale sweep ===")
-        for s in sorted(results):
-            print(f"  scale {s:>5g}  avg_score {results[s]:+.4f}")
+        print(f"\n=== sweep ({denoise or 'raw'}) ===")
+        for k in sorted(results):
+            print(f"  scale {k[0]:>5g}  lam {k[1]:>5g}  "
+                  f"avg_score {results[k]:+.4f}")
         best = max(results, key=results.get)
-        print(f"best: scale={best:g} at {results[best]:+.4f}")
+        print(f"best: scale={best[0]:g} lam={best[1]:g} at {results[best]:+.4f}")
